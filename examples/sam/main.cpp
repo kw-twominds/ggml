@@ -2,6 +2,9 @@
 
 #include "utils.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -47,9 +50,116 @@ struct sam_model {
     std::map<std::string, struct ggml_tensor *> tensors;
 };
 
+// RGB uint8 image
+struct sam_image_u8 {
+    int nx;
+    int ny;
+
+    std::vector<uint8_t> data;
+};
+
+// RGB float32 image
+struct sam_image_f32 {
+    int nx;
+    int ny;
+
+    std::vector<float> data;
+};
+
+bool sam_image_load_from_file(const std::string & fname, sam_image_u8 & img) {
+    int nx, ny, nc;
+    auto data = stbi_load(fname.c_str(), &nx, &ny, &nc, 3);
+    if (!data) {
+        fprintf(stderr, "%s: failed to load '%s'\n", __func__, fname.c_str());
+        return false;
+    }
+
+    img.nx = nx;
+    img.ny = ny;
+    img.data.resize(nx * ny * 3);
+    memcpy(img.data.data(), data, nx * ny * 3);
+
+    stbi_image_free(data);
+
+    return true;
+}
+
+
+// ref: https://github.com/facebookresearch/segment-anything/blob/efeab7296ab579d4a261e554eca80faf6b33924a/segment_anything/modeling/sam.py#L164
+// resize largest dimension to 1024
+// normalize: x = (x - mean) / std
+//     mean = [123.675, 116.28, 103.53]
+//     std  = [58.395, 57.12, 57.375]
+//     TODO: why are these hardcoded !?
+// pad to 1024x1024
+// TODO: for some reason, this is not numerically identical to pytorch's interpolation
+bool sam_image_preprocess(const sam_image_u8 & img, sam_image_f32 & res) {
+    const int nx = img.nx;
+    const int ny = img.ny;
+
+    const int nx2 = 1024;
+    const int ny2 = 1024;
+
+    res.nx = nx2;
+    res.ny = ny2;
+    res.data.resize(3*nx2*ny2);
+
+    const float scale = std::max(nx, ny) / 1024.0f;
+
+    fprintf(stderr, "%s: scale = %f\n", __func__, scale);
+
+    const int nx3 = int(nx/scale + 0.5f);
+    const int ny3 = int(ny/scale + 0.5f);
+
+    const float m3[3] = { 123.675f, 116.280f, 103.530f };
+    const float s3[3] = {  58.395f,  57.120f,  57.375f };
+
+    for (int y = 0; y < ny3; y++) {
+        for (int x = 0; x < nx3; x++) {
+            for (int c = 0; c < 3; c++) {
+                // linear interpolation
+                const float sx = (x + 0.5f)*scale - 0.5f;
+                const float sy = (y + 0.5f)*scale - 0.5f;
+
+                const int x0 = std::max(0, (int) std::floor(sx));
+                const int y0 = std::max(0, (int) std::floor(sy));
+
+                const int x1 = std::min(x0 + 1, nx - 1);
+                const int y1 = std::min(y0 + 1, ny - 1);
+
+                const float dx = sx - x0;
+                const float dy = sy - y0;
+
+                const int j00 = 3*(y0*nx + x0) + c;
+                const int j01 = 3*(y0*nx + x1) + c;
+                const int j10 = 3*(y1*nx + x0) + c;
+                const int j11 = 3*(y1*nx + x1) + c;
+
+                const float v00 = img.data[j00];
+                const float v01 = img.data[j01];
+                const float v10 = img.data[j10];
+                const float v11 = img.data[j11];
+
+                const float v0 = v00*(1.0f - dx) + v01*dx;
+                const float v1 = v10*(1.0f - dx) + v11*dx;
+
+                const float v = v0*(1.0f - dy) + v1*dy;
+
+                const uint8_t v2 = std::min(std::max(std::round(v), 0.0f), 255.0f);
+
+                const int i = 3*(y*nx3 + x) + c;
+
+                res.data[i] = (float(v2) - m3[c]) / s3[c];
+            }
+        }
+    }
+
+    return true;
+}
+
 // load the model's weights from a file
 bool sam_model_load(const std::string & fname, sam_model & model) {
-    printf("%s: loading model from '%s' - please wait ...\n", __func__, fname.c_str());
+    fprintf(stderr, "%s: loading model from '%s' - please wait ...\n", __func__, fname.c_str());
 
     auto fin = std::ifstream(fname, std::ios::binary);
     if (!fin) {
@@ -76,10 +186,10 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
         fin.read((char *) &hparams.n_enc_head,  sizeof(hparams.n_enc_head));
         fin.read((char *) &hparams.f16,         sizeof(hparams.f16));
 
-        printf("%s: n_enc_state = %d\n", __func__, hparams.n_enc_state);
-        printf("%s: n_enc_layer = %d\n", __func__, hparams.n_enc_layer);
-        printf("%s: n_enc_head  = %d\n", __func__, hparams.n_enc_head);
-        printf("%s: f16         = %d\n", __func__, hparams.f16);
+        fprintf(stderr, "%s: n_enc_state = %d\n", __func__, hparams.n_enc_state);
+        fprintf(stderr, "%s: n_enc_layer = %d\n", __func__, hparams.n_enc_layer);
+        fprintf(stderr, "%s: n_enc_head  = %d\n", __func__, hparams.n_enc_head);
+        fprintf(stderr, "%s: f16         = %d\n", __func__, hparams.f16);
     }
 
     // for the big tensors, we have the option to store the data in 16-bit floats or quantized
@@ -109,7 +219,7 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
 
         // TODO compute the size of the context
 
-        printf("%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size/(1024.0*1024.0));
+        fprintf(stderr, "%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size/(1024.0*1024.0));
     }
 
     // create the ggml context
@@ -145,7 +255,7 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
         int n_tensors = 0;
         size_t total_size = 0;
 
-        printf("%s: ", __func__);
+        fprintf(stderr, "%s: ", __func__);
 
         while (true) {
             int32_t n_dims;
@@ -189,7 +299,7 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
 
             if (0) {
                 static const char * ftype_str[] = { "f32", "f16", "q4_0", "q4_1", };
-                printf("%24s - [%5d, %5d], type = %6s, %6.2f MB, %9zu bytes\n", name.data(), ne[0], ne[1], ftype_str[ftype], ggml_nbytes(tensor)/1024.0/1024.0, ggml_nbytes(tensor));
+                fprintf(stderr, "%24s - [%5d, %5d], type = %6s, %6.2f MB, %9zu bytes\n", name.data(), ne[0], ne[1], ftype_str[ftype], ggml_nbytes(tensor)/1024.0/1024.0, ggml_nbytes(tensor));
             }
 
             size_t bpe = 0;
@@ -214,17 +324,17 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
 
             fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
 
-            //printf("%42s - [%5d, %5d], type = %6s, %6.2f MB\n", name.data(), ne[0], ne[1], ftype == 0 ? "float" : "f16", ggml_nbytes(tensor)/1024.0/1024.0);
+            //fprintf(stderr, "%42s - [%5d, %5d], type = %6s, %6.2f MB\n", name.data(), ne[0], ne[1], ftype == 0 ? "float" : "f16", ggml_nbytes(tensor)/1024.0/1024.0);
             total_size += ggml_nbytes(tensor);
             if (++n_tensors % 8 == 0) {
-                printf(".");
+                fprintf(stderr, ".");
                 fflush(stdout);
             }
         }
 
-        printf(" done\n");
+        fprintf(stderr, " done\n");
 
-        printf("%s: model size = %8.2f MB / num tensors = %d\n", __func__, total_size/1024.0/1024.0, n_tensors);
+        fprintf(stderr, "%s: model size = %8.2f MB / num tensors = %d\n", __func__, total_size/1024.0/1024.0, n_tensors);
     }
 
     fin.close();
@@ -235,11 +345,10 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
 int main(int argc, char ** argv) {
     const int64_t t_main_start_us = ggml_time_us();
 
-    gpt_params params;
+    sam_params params;
     params.model = "models/sam-vit-b/ggml-model-f16.bin";
 
-    // TODO: sam_params_parse
-    if (gpt_params_parse(argc, argv, params) == false) {
+    if (sam_params_parse(argc, argv, params) == false) {
         return 1;
     }
 
@@ -247,7 +356,34 @@ int main(int argc, char ** argv) {
         params.seed = time(NULL);
     }
 
-    printf("%s: seed = %d\n", __func__, params.seed);
+    fprintf(stderr, "%s: seed = %d\n", __func__, params.seed);
+
+    // load the image
+    sam_image_u8 img0;
+    if (!sam_image_load_from_file(params.fname_inp, img0)) {
+        fprintf(stderr, "%s: failed to load image from '%s'\n", __func__, params.fname_inp.c_str());
+        return 1;
+    }
+
+    fprintf(stderr, "%s: loaded image '%s' (%d x %d)\n", __func__, params.fname_inp.c_str(), img0.nx, img0.ny);
+
+    // preprocess to f32
+    sam_image_f32 img1;
+    if (!sam_image_preprocess(img0, img1)) {
+        fprintf(stderr, "%s: failed to preprocess image\n", __func__);
+        return 1;
+    }
+
+    fprintf(stderr, "%s: preprocessed image (%d x %d)\n", __func__, img1.nx, img1.ny);
+
+    {
+        const int n = 128;
+        fprintf(stderr, "%s: first %d diagonal pixels:\n", __func__, n);
+        for (int i = 0; i < n; i++) {
+            const int ii = i*img1.nx + i;
+            fprintf(stderr, "%s:   %d: %f %f %f\n", __func__, i, img1.data[3*ii + 0], img1.data[3*ii + 1], img1.data[3*ii + 2]);
+        }
+    }
 
     int64_t t_load_us = 0;
 
@@ -269,9 +405,9 @@ int main(int argc, char ** argv) {
     {
         const int64_t t_main_end_us = ggml_time_us();
 
-        printf("\n\n");
-        printf("%s:     load time = %8.2f ms\n", __func__, t_load_us/1000.0f);
-        printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0f);
+        fprintf(stderr, "\n\n");
+        fprintf(stderr, "%s:     load time = %8.2f ms\n", __func__, t_load_us/1000.0f);
+        fprintf(stderr, "%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0f);
     }
 
     ggml_free(model.ctx);

@@ -48,9 +48,10 @@ hparams = {
 
 print(hparams)
 
-#for k, v in model.items():
-#    print(k, v.shape)
+for k, v in model.items():
+    print(k, v.shape)
 
+exit()
 #code.interact(local=locals())
 
 fout = open(fname_out, "wb")
