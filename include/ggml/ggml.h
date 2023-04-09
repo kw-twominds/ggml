@@ -316,6 +316,7 @@ extern "C" {
         GGML_OP_CLAMP,
         GGML_OP_CONV_1D_1S,
         GGML_OP_CONV_1D_2S,
+        GGML_OP_CONV_2D,
 
         GGML_OP_FLASH_ATTN,
         GGML_OP_FLASH_FF,
@@ -919,6 +920,12 @@ extern "C" {
             struct ggml_tensor  * b);
 
     GGML_API struct ggml_tensor * ggml_conv_1d_2s(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // stride is equal to kernel size
+    GGML_API struct ggml_tensor * ggml_conv_2d(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
