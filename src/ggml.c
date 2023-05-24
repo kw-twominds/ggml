@@ -13814,10 +13814,18 @@ static void ggml_visit_parents(struct ggml_cgraph * cgraph, struct ggml_tensor *
         // reached a leaf node, not part of the gradient graph (e.g. a constant)
         GGML_ASSERT(cgraph->n_leafs < GGML_MAX_NODES);
 
+        if (strlen(node->name) == 0) {
+            snprintf(node->name, sizeof(node->name), "leaf_%d", cgraph->n_leafs);
+        }
+
         cgraph->leafs[cgraph->n_leafs] = node;
         cgraph->n_leafs++;
     } else {
         GGML_ASSERT(cgraph->n_nodes < GGML_MAX_NODES);
+
+        if (strlen(node->name) == 0) {
+            snprintf(node->name, sizeof(node->name), "node_%d", cgraph->n_nodes);
+        }
 
         cgraph->nodes[cgraph->n_nodes] = node;
         cgraph->grads[cgraph->n_nodes] = node->grad;
