@@ -4020,6 +4020,10 @@ size_t ggml_set_scratch(struct ggml_context * ctx, struct ggml_scratch scratch) 
     return result;
 }
 
+void ggml_set_no_alloc(struct ggml_context * ctx, bool no_alloc) {
+    ctx->no_alloc = no_alloc;
+}
+
 // IMPORTANT:
 // when creating "opt" tensors, always save and load the scratch buffer
 // this is an error prone process, but it is necessary to support inplace
@@ -4064,7 +4068,7 @@ struct ggml_tensor * ggml_new_tensor_impl(
     struct ggml_object * const obj_new = (struct ggml_object *)(mem_buffer + cur_end);
 
     if (ctx->scratch.data == NULL || data != NULL) {
-        size_needed += sizeof(struct ggml_tensor);
+        size_needed += GGML_TENSOR_SIZE;
 
         if (cur_end + size_needed + GGML_OBJECT_SIZE > ctx->mem_size) {
             GGML_PRINT("%s: not enough space in the context's memory pool (needed %zu, available %zu)\n",
@@ -4086,9 +4090,9 @@ struct ggml_tensor * ggml_new_tensor_impl(
             return NULL;
         }
 
-        if (cur_end + sizeof(struct ggml_tensor) + GGML_OBJECT_SIZE > ctx->mem_size) {
+        if (cur_end + GGML_TENSOR_SIZE + GGML_OBJECT_SIZE > ctx->mem_size) {
             GGML_PRINT("%s: not enough space in the context's memory pool (needed %zu, available %zu)\n",
-                    __func__, cur_end + sizeof(struct ggml_tensor) + GGML_OBJECT_SIZE, ctx->mem_size);
+                    __func__, cur_end + GGML_TENSOR_SIZE + GGML_OBJECT_SIZE, ctx->mem_size);
             assert(false);
             return NULL;
         }
@@ -4097,7 +4101,7 @@ struct ggml_tensor * ggml_new_tensor_impl(
 
         *obj_new = (struct ggml_object) {
             .offs = cur_end + GGML_OBJECT_SIZE,
-            .size = sizeof(struct ggml_tensor),
+            .size = GGML_TENSOR_SIZE,
             .next = NULL,
         };
 
