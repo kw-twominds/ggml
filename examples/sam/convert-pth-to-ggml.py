@@ -41,9 +41,11 @@ model = torch.load(fname_model, map_location="cpu")
 # TODO: determine based on model data
 # TODO: add decoder / prompt encoder if needed
 hparams = {
-    "n_enc_state":  768,
-    "n_enc_layers":  12,
-    "n_enc_heads":   12,
+    "n_enc_state":      768,
+    "n_enc_layers":      12,
+    "n_enc_heads":       12,
+    "n_enc_out_chans":  256,
+    "n_enc_patch_size":  16,
 }
 
 print(hparams)
@@ -51,7 +53,7 @@ print(hparams)
 for k, v in model.items():
     print(k, v.shape)
 
-exit()
+#exit()
 #code.interact(local=locals())
 
 fout = open(fname_out, "wb")
@@ -60,6 +62,8 @@ fout.write(struct.pack("i", 0x67676d6c)) # magic: ggml in hex
 fout.write(struct.pack("i", hparams["n_enc_state"]))
 fout.write(struct.pack("i", hparams["n_enc_layers"]))
 fout.write(struct.pack("i", hparams["n_enc_heads"]))
+fout.write(struct.pack("i", hparams["n_enc_out_chans"]))
+fout.write(struct.pack("i", hparams["n_enc_patch_size"]))
 fout.write(struct.pack("i", ftype))
 
 for k, v in model.items():
@@ -73,7 +77,8 @@ for k, v in model.items():
     print("Processing variable: " + name + " with shape: ", shape, " and type: ", v.dtype)
 
     #data = tf.train.load_variable(dir_model, name).squeeze()
-    data = v.numpy().squeeze()
+    #data = v.numpy().squeeze()
+    data = v.numpy()
     n_dims = len(data.shape);
 
     # for efficiency - transpose some matrices

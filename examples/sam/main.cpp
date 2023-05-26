@@ -16,14 +16,21 @@
 
 // default hparams (ViT-B SAM)
 struct sam_hparams {
-    int32_t n_enc_state = 768;
-    int32_t n_enc_layer = 12;
-    int32_t n_enc_head  = 12;
-    int32_t f16     = 1;
+    int32_t n_enc_state       = 768;
+    int32_t n_enc_layer       = 12;
+    int32_t n_enc_head        = 12;
+    int32_t n_enc_out_chans   = 256;
+    int32_t n_enc_patch_size  = 16;
+    int32_t n_enc_window_size = 14;
+    int32_t ftype             = 1;
 };
 
 struct sam_layer_enc {
-    // TODO
+    struct ggml_tensor * norm1_w;
+    struct ggml_tensor * norm1_b;
+
+    struct ggml_tensor * rel_pos_w;
+    struct ggml_tensor * rel_pos_h;
 };
 
 struct sam_layer_enc_prompt {
@@ -37,7 +44,17 @@ struct sam_layer_dec {
 struct sam_model {
     sam_hparams hparams;
 
-    // TODO
+    struct ggml_tensor * proj_w;
+    struct ggml_tensor * proj_b;
+
+    struct ggml_tensor * neck_conv_0;
+    struct ggml_tensor * neck_norm_0_w;
+    struct ggml_tensor * neck_norm_0_b;
+    struct ggml_tensor * neck_conv_1;
+    struct ggml_tensor * neck_norm_1_w;
+    struct ggml_tensor * neck_norm_1_b;
+
+    struct ggml_tensor * pe;
 
     std::vector<sam_layer_enc>        layers_enc;
     std::vector<sam_layer_enc_prompt> layers_enc_prompt;
@@ -181,34 +198,34 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
     {
         auto & hparams = model.hparams;
 
-        fin.read((char *) &hparams.n_enc_state, sizeof(hparams.n_enc_state));
-        fin.read((char *) &hparams.n_enc_layer, sizeof(hparams.n_enc_layer));
-        fin.read((char *) &hparams.n_enc_head,  sizeof(hparams.n_enc_head));
-        fin.read((char *) &hparams.f16,         sizeof(hparams.f16));
+        fin.read((char *) &hparams.n_enc_state,      sizeof(hparams.n_enc_state));
+        fin.read((char *) &hparams.n_enc_layer,      sizeof(hparams.n_enc_layer));
+        fin.read((char *) &hparams.n_enc_head,       sizeof(hparams.n_enc_head));
+        fin.read((char *) &hparams.n_enc_out_chans,  sizeof(hparams.n_enc_out_chans));
+        fin.read((char *) &hparams.n_enc_patch_size, sizeof(hparams.n_enc_patch_size));
+        fin.read((char *) &hparams.ftype,            sizeof(hparams.ftype));
 
-        fprintf(stderr, "%s: n_enc_state = %d\n", __func__, hparams.n_enc_state);
-        fprintf(stderr, "%s: n_enc_layer = %d\n", __func__, hparams.n_enc_layer);
-        fprintf(stderr, "%s: n_enc_head  = %d\n", __func__, hparams.n_enc_head);
-        fprintf(stderr, "%s: f16         = %d\n", __func__, hparams.f16);
+        const int32_t qntvr = hparams.ftype / GGML_QNT_VERSION_FACTOR;
+
+        printf("%s: n_enc_state      = %d\n", __func__, hparams.n_enc_state);
+        printf("%s: n_enc_layer      = %d\n", __func__, hparams.n_enc_layer);
+        printf("%s: n_enc_head       = %d\n", __func__, hparams.n_enc_head);
+        printf("%s: n_enc_out_chans  = %d\n", __func__, hparams.n_enc_out_chans);
+        printf("%s: n_enc_patch_size = %d\n", __func__, hparams.n_enc_patch_size);
+        printf("%s: ftype            = %d\n", __func__, hparams.ftype);
+        printf("%s: qntvr            = %d\n", __func__, qntvr);
+
+        hparams.ftype %= GGML_QNT_VERSION_FACTOR;
     }
 
     // for the big tensors, we have the option to store the data in 16-bit floats or quantized
     // in order to save memory and also to speed up the computation
-    ggml_type wtype = GGML_TYPE_COUNT;
-    switch (model.hparams.f16) {
-        case 0: wtype = GGML_TYPE_F32;  break;
-        case 1: wtype = GGML_TYPE_F16;  break;
-        case 2: wtype = GGML_TYPE_Q4_0; break;
-        case 3: wtype = GGML_TYPE_Q4_1; break;
-        default:
-                {
-                    fprintf(stderr, "%s: invalid model file '%s' (bad f16 value %d)\n",
-                            __func__, fname.c_str(), model.hparams.f16);
-                    return false;
-                }
+    ggml_type wtype = ggml_ftype_to_ggml_type((ggml_ftype) (model.hparams.ftype));
+    if (wtype == GGML_TYPE_COUNT) {
+        fprintf(stderr, "%s: invalid model file '%s' (bad ftype value %d)\n",
+                __func__, fname.c_str(), model.hparams.ftype);
+        return false;
     }
-
-    const ggml_type wtype2 = GGML_TYPE_F32;
 
     auto & ctx = model.ctx;
 
@@ -217,7 +234,37 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
     {
         const auto & hparams = model.hparams;
 
-        // TODO compute the size of the context
+        const int32_t n_enc_state      = hparams.n_enc_state;
+        const int32_t n_enc_layer      = hparams.n_enc_layer;
+        const int32_t n_enc_out_chans  = hparams.n_enc_out_chans;
+        const int32_t n_enc_patch_size = hparams.n_enc_patch_size;
+
+        // encoder
+        {
+            ctx_size += n_enc_state*3*n_enc_patch_size*n_enc_patch_size*ggml_type_sizef(GGML_TYPE_F16);
+            ctx_size += n_enc_state*ggml_type_sizef(GGML_TYPE_F32);
+
+            ctx_size +=     n_enc_state*n_enc_out_chans*1*1*ggml_type_sizef(GGML_TYPE_F16);
+            ctx_size += n_enc_out_chans*n_enc_out_chans*3*3*ggml_type_sizef(GGML_TYPE_F16);
+
+            ctx_size += n_enc_out_chans*ggml_type_sizef(GGML_TYPE_F32);
+            ctx_size += n_enc_out_chans*ggml_type_sizef(GGML_TYPE_F32);
+
+            ctx_size += n_enc_out_chans*ggml_type_sizef(GGML_TYPE_F32);
+            ctx_size += n_enc_out_chans*ggml_type_sizef(GGML_TYPE_F32);
+        }
+
+        // encoder layers
+        {
+            size_t ctx_size_layer = 0;
+
+            ctx_size_layer += n_enc_state*ggml_type_sizef(GGML_TYPE_F32);
+            ctx_size_layer += n_enc_state*ggml_type_sizef(GGML_TYPE_F32);
+
+            ctx_size += n_enc_layer*ctx_size_layer;
+        }
+
+        ctx_size += (8 + 14*n_enc_layer)*512; // object overhead
 
         fprintf(stderr, "%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size/(1024.0*1024.0));
     }
@@ -227,10 +274,11 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
         struct ggml_init_params params = {
             .mem_size   = ctx_size,
             .mem_buffer = NULL,
+            .no_alloc   = false,
         };
 
-        model.ctx = ggml_init(params);
-        if (!model.ctx) {
+        ctx = ggml_init(params);
+        if (!ctx) {
             fprintf(stderr, "%s: ggml_init() failed\n", __func__);
             return false;
         }
@@ -239,6 +287,53 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
     // prepare memory for the weights
     {
         const auto & hparams = model.hparams;
+
+        const int32_t n_enc_state      = hparams.n_enc_state;
+        const int32_t n_enc_layer      = hparams.n_enc_layer;
+        const int32_t n_enc_out_chans  = hparams.n_enc_out_chans;
+        const int32_t n_enc_patch_size = hparams.n_enc_patch_size;
+
+        model.layers_enc.resize(n_enc_layer);
+
+        // encoder
+        {
+            model.proj_w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_enc_patch_size, n_enc_patch_size, n_enc_state, 3);
+            model.proj_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_state);
+
+            model.neck_conv_0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, n_enc_out_chans, n_enc_state);
+            model.neck_conv_1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, n_enc_out_chans, n_enc_out_chans);
+
+            model.neck_norm_0_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
+            model.neck_norm_0_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
+
+            model.neck_norm_1_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
+            model.neck_norm_1_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_out_chans);
+
+            model.tensors["image_encoder.patch_embed.proj.weight"] = model.proj_w;
+            model.tensors["image_encoder.patch_embed.proj.bias"]   = model.proj_b;
+
+            model.tensors["image_encoder.neck.0.weight"] = model.neck_conv_0;
+            model.tensors["image_encoder.neck.2.weight"] = model.neck_conv_1;
+
+            model.tensors["image_encoder.neck.1.weight"] = model.neck_norm_0_w;
+            model.tensors["image_encoder.neck.1.bias"]   = model.neck_norm_0_b;
+
+            model.tensors["image_encoder.neck.3.weight"] = model.neck_norm_1_w;
+            model.tensors["image_encoder.neck.3.bias"]   = model.neck_norm_1_b;
+
+            for (int i = 0; i < n_enc_layer; ++i) {
+                auto & layer = model.layers_enc[i];
+
+                layer.norm1_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_state);
+                layer.norm1_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_state);
+
+                layer.rel_pos_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_state);
+                layer.rel_pos_h = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_enc_state);
+
+                model.tensors["image_encoder.blocks." + std::to_string(i) + ".norm1.weight"] = layer.norm1_w;
+                model.tensors["image_encoder.blocks." + std::to_string(i) + ".norm1.bias"]   = layer.norm1_b;
+            }
+        }
 
         // TODO
     }
@@ -271,7 +366,7 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
             }
 
             int64_t nelements = 1;
-            int64_t ne[2] = { 1, 1 };
+            int64_t ne[4] = { 1, 1, 1, 1 };
             for (int i = 0; i < n_dims; ++i) {
                 int32_t ne_cur;
                 fin.read(reinterpret_cast<char *>(&ne_cur), sizeof(ne_cur));
@@ -288,8 +383,10 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
             }
 
             auto tensor = model.tensors[name.data()];
+            printf("ne0 = %d, ne1 = %d, ne2 = %d, ne3 = %d\n", (int) tensor->ne[0], (int) tensor->ne[1], (int) tensor->ne[2], (int) tensor->ne[3]);
             if (ggml_nelements(tensor) != nelements) {
-                fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
+                fprintf(stderr, "%s: tensor '%s' has wrong size in model file: got %d, expected %d\n",
+                        __func__, name.data(), (int) nelements, (int) ggml_nelements(tensor));
                 return false;
             }
 
@@ -297,11 +394,6 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
                 fprintf(stderr, "%s: tensor '%s' has wrong shape in model file: got [%d, %d], expected [%d, %d]\n",
                         __func__, name.data(), (int) tensor->ne[0], (int) tensor->ne[1], (int) ne[0], (int) ne[1]);
                 return false;
-            }
-
-            if (0) {
-                static const char * ftype_str[] = { "f32", "f16", "q4_0", "q4_1", };
-                fprintf(stderr, "%24s - [%5d, %5d], type = %6s, %6.2f MB, %9zu bytes\n", name.data(), (int) ne[0], (int) ne[1], ftype_str[ftype], ggml_nbytes(tensor)/1024.0/1024.0, ggml_nbytes(tensor));
             }
 
             size_t bpe = 0;
@@ -326,7 +418,6 @@ bool sam_model_load(const std::string & fname, sam_model & model) {
 
             fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
 
-            //fprintf(stderr, "%42s - [%5d, %5d], type = %6s, %6.2f MB\n", name.data(), ne[0], ne[1], ftype == 0 ? "float" : "f16", ggml_nbytes(tensor)/1024.0/1024.0);
             total_size += ggml_nbytes(tensor);
             if (++n_tensors % 8 == 0) {
                 fprintf(stderr, ".");
@@ -378,7 +469,7 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "%s: preprocessed image (%d x %d)\n", __func__, img1.nx, img1.ny);
 
-#if 0
+#if 1
     {
         const int n = 128;
         fprintf(stderr, "%s: first %d diagonal pixels:\n", __func__, n);
